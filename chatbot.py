@@ -9,13 +9,36 @@ from langchain_core.messages import trim_messages
 from langchain_core.vectorstores import InMemoryVectorStore
 from langchain_openai import OpenAIEmbeddings
 from langchain_core.messages import SystemMessage
+from langchain_community.document_loaders import PyPDFLoader  
+from langchain.text_splitter import CharacterTextSplitter
+from langchain_community.vectorstores import FAISS
+from langchain_openai import OpenAIEmbeddings  # ✅ Correct import
 import asyncio
+import wikipediaapi
+
 
 # Load API Key from .env file
 load_dotenv()
-
-# Set API key from environment variable
 api_key = os.getenv("OPENAI_API_KEY")
+                    
+# Debugging: Print API Key (remove this after testing)
+if not api_key:
+    raise ValueError("Missing OpenAI API Key. Check your .env file or set it manually.")
+# print(api_key)
+
+# Load documents
+pdf_loader = PyPDFLoader("testRAG.pdf")  # For PDFs
+
+# Split documents into smaller chunks for better retrieval
+text_splitter = CharacterTextSplitter(chunk_size=512, chunk_overlap=50)
+docs = text_splitter.split_documents(pdf_loader.load())
+
+# Create a FAISS vector store
+embeddings = OpenAIEmbeddings()
+vector_store = FAISS.from_documents(docs, embeddings)
+
+# Save vector store to disk (optional for persistence)
+vector_store.save_local("faiss_index")
 
 # Set LangSmith API keys from .env
 os.environ["LANGCHAIN_TRACING_V2"] = "true"
@@ -26,11 +49,6 @@ if not api_key:
 
 # Define model from chatGPT
 model = ChatOpenAI(model="gpt-4o-mini", openai_api_key=os.environ["OPENAI_API_KEY"])
-
-embeddings = OpenAIEmbeddings(model="text-embedding-3-large")
-vector_store = InMemoryVectorStore(embeddings)
-
-
 
 # Store conversation memory for multiple users
 user_conversations = {}  # Dictionary to store conversations by user
@@ -45,31 +63,74 @@ trimmer = trim_messages(
     start_on="human",
 )
 
+def search_wikipedia(query):
+    """Search Wikipedia only if 'Wikipedia' is mentioned in the query."""
+    if "wikipedia" not in query.lower():
+        return None  # Do nothing if "Wikipedia" isn't mentioned
+
+    # Remove "Wikipedia" from query before searching
+    clean_query = query.lower().replace("wikipedia", "").strip()
+
+    wiki = wikipediaapi.Wikipedia(language = "en", user_agent="MyChatbot/1.0 (sofie.seilnacht@berkeley.edu)")
+    page = wiki.page(clean_query)
+
+    # Debugging: Check if Wikipedia is returning anything
+    if page.exists():
+        print("\n🌍 Wikipedia Search Found:\n", page.summary[:750])
+        return page.summary[:750]  # Limit response length
+    else:
+        print("\n⚠️ No Wikipedia article found for:", clean_query)
+        return "Sorry, no Wikipedia article found on that topic."
+    
 # Define the async function for model interaction
 async def call_model(state: MessagesState):
-    """Handles chatbot response asynchronously with RAG (retrieval)."""
+    """Handles chatbot response asynchronously with RAG + Streaming."""
 
-    # Trim messages to prevent overload
+    # Trim messages to prevent token overload
     trimmed_messages = trimmer.invoke(state["messages"])
 
     # Extract latest user query
     latest_query = trimmed_messages[-1].content  
+    
+    # If "Wikipedia" is mentioned, fetch from Wikipedia
+    wiki_answer = search_wikipedia(latest_query)
+    if wiki_answer:  # If Wikipedia was searched, return its result
+        return {"messages": state["messages"] + [AIMessage(content=wiki_answer)]}
 
     # Retrieve relevant documents from memory
-    retrieved_docs = vector_store.similarity_search(latest_query, k=3)
-    filtered_docs = [doc for doc, score in retrieved_docs if score > 0.7]
+    retrieved_docs = vector_store.similarity_search_with_score(latest_query, k=3)
+    filtered_docs = [doc for doc, score in retrieved_docs if score > 0.3]
     retrieved_texts = "\n".join([doc.page_content for doc in filtered_docs])
 
-    # Add retrieved knowledge to the model prompt
-    system_message = SystemMessage(content=f"Use the following knowledge:\n{retrieved_texts}")
-    full_messages = [system_message] + trimmed_messages
+    # Debugging: Print retrieved documents
+    # if not retrieved_docs:
+    #     print("\n⚠️ No matching documents found for query:", latest_query)
+    # else:
+    #     print("\n✅ Retrieved Documents for Query:", latest_query)
+    #     for doc, score in retrieved_docs:
+    #         print(f"\n🔹 Score: {score} - Content: {doc.page_content[:200]}...")
 
-    # Stream chatbot response (Real-time output)
+    # # ✅ Debug: Print retrieved knowledge inside function
+    # print("\n🔍 Retrieved Documents for RAG:\n", retrieved_texts)
+
+    # If documents are found, use them for the response
+    if retrieved_texts:
+        system_message = SystemMessage(content=f"Use the following knowledge:\n{retrieved_texts}")
+        full_messages = [system_message] + trimmed_messages
+    else:
+        full_messages = trimmed_messages  # No documents? Just use OpenAI.
+
+    # Stream chatbot response in real-time
+    print("\n🤖 Chatbot:", end=" ", flush=True)
     response_text = ""
-    async for chunk in model.astream(full_messages):  # Stream response chunks
-        response_text += chunk.content  # Build response as it streams
 
-    # Store final response
+    async for chunk in model.astream(full_messages):  # Stream response chunks
+        print(chunk.content, end="", flush=True)
+        response_text += chunk.content  # Collect full response for storage
+
+    print("\n")  # Newline after response finishes
+
+    # Store final response in chat history
     response = AIMessage(content=response_text)
 
     return {"messages": trimmed_messages + [response]}  # Append response to chat history
@@ -117,8 +178,6 @@ async def chat():
 
         # Extract and print latest chatbot response
         chatbot_response = output["messages"][-1]
-        print(f"\n🤖 {user_id}, Chatbot: {chatbot_response.content}\n")
-
         # Append chatbot response to history
         user_conversations[user_id].append(chatbot_response)
 
