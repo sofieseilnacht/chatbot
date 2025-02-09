@@ -114,7 +114,7 @@ CREATE TABLE IF NOT EXISTS chat_history (
 conn.commit()
 
 def get_recent_past_conversations(user_id, limit=10):
-    """Fetch the last 'limit' messages from the database."""
+    """Fetch the last 'limit' messages from the database, excluding recall requests."""
     
     # Debug: Print the query being executed
     print(f"Retrieving last {limit} messages for user: {user_id}")
@@ -122,16 +122,26 @@ def get_recent_past_conversations(user_id, limit=10):
     cursor.execute("""
         SELECT message, response FROM chat_history
         WHERE user_id = ? 
-        ORDER BY id DESC 
+        ORDER BY id DESC
         LIMIT ?
     """, (user_id, int(limit)))  # ✅ Ensure limit is an integer
     
     results = cursor.fetchall()
-    
-    # Debug: Print retrieved results
-    print(f"Retrieved {len(results)} messages: {results}")
-    
-    return results
+
+    # Debug: Print raw retrieved results before filtering
+    print(f"Retrieved {len(results)} messages (before filtering): {results}")
+
+    # 🔹 Filter out messages where the user input contains "recall" (case-insensitive)
+    filtered_results = [msg for msg in results if "recall" not in msg[0].lower()]
+
+    # Get only the last `limit` messages **after filtering** to ensure correct count
+    final_results = filtered_results[-limit:]
+
+    # Debug: Print final retrieved results after filtering
+    print(f"Final {len(final_results)} messages (after filtering): {final_results}")
+
+    return final_results
+
 
 
 
