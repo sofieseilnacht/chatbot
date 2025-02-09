@@ -128,8 +128,8 @@ def get_recent_past_conversations(user_id, limit=10):
     
     results = cursor.fetchall()
 
-    # Debug: Print raw retrieved results before filtering
-    print(f"Retrieved {len(results)} messages (before filtering): {results}")
+    # # Debug: Print raw retrieved results before filtering
+    # print(f"Retrieved {len(results)} messages (before filtering): {results}")
 
     # 🔹 Filter out messages where the user input contains "recall" (case-insensitive)
     filtered_results = [msg for msg in results if "recall" not in msg[0].lower()]
@@ -137,12 +137,10 @@ def get_recent_past_conversations(user_id, limit=10):
     # Get only the last `limit` messages **after filtering** to ensure correct count
     final_results = filtered_results[-limit:]
 
-    # Debug: Print final retrieved results after filtering
-    print(f"Final {len(final_results)} messages (after filtering): {final_results}")
+    # # Debug: Print final retrieved results after filtering
+    # print(f"Final {len(final_results)} messages (after filtering): {final_results}")
 
     return final_results
-
-
 
 
 def save_to_db(user_id, message, response):
