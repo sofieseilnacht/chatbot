@@ -124,21 +124,15 @@ def get_recent_past_conversations(user_id, limit=10):
         WHERE user_id = ? 
         ORDER BY id DESC
         LIMIT ?
-    """, (user_id, int(limit)))  # ✅ Ensure limit is an integer
+    """, (user_id, int(limit)))  # Ensure limit is an integer
     
     results = cursor.fetchall()
-
-    # # Debug: Print raw retrieved results before filtering
-    # print(f"Retrieved {len(results)} messages (before filtering): {results}")
 
     # 🔹 Filter out messages where the user input contains "recall" (case-insensitive)
     filtered_results = [msg for msg in results if "recall" not in msg[0].lower()]
 
     # Get only the last `limit` messages **after filtering** to ensure correct count
     final_results = filtered_results[-limit:]
-
-    # # Debug: Print final retrieved results after filtering
-    # print(f"Final {len(final_results)} messages (after filtering): {final_results}")
 
     return final_results
 
@@ -161,43 +155,43 @@ async def call_model(state: MessagesState):
     # Extract latest user query
     latest_query = trimmed_messages[-1].content  
 
-    # ✅ Handle Recall Requests ONLY When Necessary
+    # Handle Recall Requests ONLY When Necessary
     if any(keyword in latest_query.lower() for keyword in ["recall", "remember", "look back"]):
         user_id = state.get("user_id", "default_user")  # Get user ID
-        past_chats = get_recent_past_conversations(user_id, limit=10)  # ✅ Only fetch last 10 messages
+        past_chats = get_recent_past_conversations(user_id, limit=10)  # Only fetch last 10 messages
 
         if past_chats:
-            # ✅ Convert past messages into a formatted summary
+            # Convert past messages into a formatted summary
             chat_history_text = "\n".join([f"User: {msg} | Bot: {resp}" for msg, resp in past_chats])
             summary = summarizer.parse(f"Summarize user past interactions and provide a direct answer:\n{chat_history_text}")
             
-            # ✅ Modify query to reflect the recall summary, ensuring a **direct answer**
+            # Modify query to reflect the recall summary, ensuring a **direct answer**
             query = f"Based on this summary: {summary}, {latest_query}"
         else:
-            return {"messages": trimmed_messages + [AIMessage(content="I don't seem to have past records.")]}  # ✅ Early return if no records exist
+            return {"messages": trimmed_messages + [AIMessage(content="I don't seem to have past records.")]}  # Early return if no records exist
 
     else:
-        # ✅ If no recall is requested, process query as usual
+        # If no recall is requested, process query as usual
         query = latest_query  # Keep the original input
 
-    # ✅ Streaming Chatbot Response
+    # Streaming Chatbot Response
     print("\n🤖 Chatbot:", end=" ", flush=True)
     response_text = ""
 
     async for chunk in model.astream(trimmed_messages + [HumanMessage(content=query)]):
-        if hasattr(chunk, "content"):  # ✅ Check if 'chunk' has a 'content' attribute
-            chunk_content = chunk.content  # ✅ Directly access 'content'
+        if hasattr(chunk, "content"):  # Check if 'chunk' has a 'content' attribute
+            chunk_content = chunk.content  # Directly access 'content'
         else:
             chunk_content = ""
 
         if chunk_content:
-            print(chunk_content, end="", flush=True)  # ✅ Stream response
-            response_text += chunk_content  # ✅ Collect response text
+            print(chunk_content, end="", flush=True)  # Stream response
+            response_text += chunk_content  # Collect response text
 
 
     print("\n")  # Newline after response finishes
 
-    # ✅ Store final response in chat history & return
+    # Store final response in chat history & return
     response = AIMessage(content=response_text.strip())
 
     return {"messages": trimmed_messages + [response]}  # Append response to chat history
@@ -232,9 +226,9 @@ async def chat():
             break
 
         user_conversations[user_id].append(HumanMessage(content=query))
-        response_text = ""  # ✅ Always initialize before using
+        response_text = ""  # Always initialize before using
 
-        # ✅ CHECK IF QUERY REQUIRES RECALL (ONLY THEN ACCESS DATABASE)
+        # Check if query requires recall (only then access database) 
         if any(keyword in query.lower() for keyword in ["recall", "remember"]):
             try:
                 past_chats = get_recent_past_conversations(user_id, limit=10)  
@@ -242,7 +236,7 @@ async def chat():
                 if past_chats:
                     chat_history_text = "\n".join([f"User: {msg} | Bot: {resp}" for msg, resp in past_chats])
 
-                    # ✅ Generate a **direct answer** based on past conversation
+                    # Generate a **direct answer** based on past conversation
                     recall_prompt = f"""
                     The user wants to recall past conversations. 
                     Here are the last few exchanges:
@@ -256,16 +250,16 @@ async def chat():
                     🔹 DO NOT summarize vaguely—give a factual answer.
                     """
 
-                    response = model.invoke([HumanMessage(content=recall_prompt)])  # ✅ Force direct response
+                    response = model.invoke([HumanMessage(content=recall_prompt)])  # Force direct response
                     response_text = response.content.strip()
 
                     print(f"\n🔍 Recall Triggered. Using past memory for response.\n")
-                    print(f"\n🤖 Chatbot: {response_text}\n")  # ✅ Print response immediately
+                    print(f"\n🤖 Chatbot: {response_text}\n")  # Print response immediately
 
                     chatbot_response = AIMessage(content=response_text)
                     user_conversations[user_id].append(chatbot_response)
                     save_to_db(user_id, query, chatbot_response.content)  
-                    continue  # ✅ Skip normal chatbot flow after recall
+                    continue  # Skip normal chatbot flow after recall
 
                 else:
                     print("\n🤖 Chatbot: I don't seem to have past records.\n")
@@ -275,7 +269,7 @@ async def chat():
                 print(f"\n⚠️ Error fetching past conversations: {str(e)}\n")
                 continue  
 
-        # ✅ NORMAL CHATBOT FLOW (NO MEMORY LOOKUP)
+        # NORMAL CHATBOT FLOW (NO MEMORY LOOKUP)
         try:
             async for chunk in app.astream(
                 {"messages": user_conversations[user_id] + [HumanMessage(content=query)]},
@@ -285,7 +279,7 @@ async def chat():
                     "checkpoint_id": f"{user_id}_{len(user_conversations[user_id])}"
                 }
             ):
-                chunk_content = getattr(chunk, "content", "")  # ✅ Avoid AttributeError
+                chunk_content = getattr(chunk, "content", "")  # Avoid AttributeError
 
                 if chunk_content:  
                     print(chunk_content, end="", flush=True)
@@ -295,7 +289,7 @@ async def chat():
             print(f"\n⚠️ Error during response streaming: {str(e)}")
             response_text = "Sorry, an error occurred while processing your request." 
 
-        # ✅ Store only if valid response
+        # Store only if valid response
         chatbot_response = AIMessage(content=response_text.strip() if response_text else "No response generated.")
         user_conversations[user_id].append(chatbot_response)
         save_to_db(user_id, query, chatbot_response.content)  
