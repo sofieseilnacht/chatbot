@@ -109,7 +109,7 @@ CREATE TABLE IF NOT EXISTS chat_history (
 """)
 conn.commit()
 
-def get_recent_past_conversations(user_id, limit=10):
+def get_recent_past_conversations(user_id, limit=2):
     """Fetches the last `limit` messages for context, ensuring efficiency."""
     cursor.execute(
         "SELECT message, response FROM chat_history WHERE user_id = ? ORDER BY id DESC LIMIT ?", 
@@ -122,46 +122,6 @@ def save_to_db(user_id, message, response):
             cursor.execute("INSERT INTO chat_history (user_id, message, response) VALUES (?, ?, ?)", 
                         (user_id, message, response))
             conn.commit()
-
-# async def call_model(state: MessagesState):
-#     """Handles chatbot response asynchronously using the REACT agent with real-time streaming."""
-
-#     # Trim messages to prevent token overload
-#     trimmed_messages = trimmer.invoke(state["messages"])
-    
-#     # Extract latest user query
-#     latest_query = trimmed_messages[-1].content  
-
-#     # Wikipedia Search (if explicitly mentioned)
-#     wiki_answer = search_wikipedia(latest_query)
-#     if wiki_answer:
-#         return {"messages": trimmed_messages + [AIMessage(content=wiki_answer)]}
-
-#     # Check if user asks for past conversations
-#     if "recall" in latest_query.lower() or "remember" in latest_query.lower():
-#         user_id = state.get("user_id", "default_user")  # Get user ID
-#         past_chats = get_recent_past_conversations(user_id, limit=3)  # Fetch past convos
-#         retrieved_texts = "\n".join([f"User: {msg} | Bot: {resp}" for msg, resp in past_chats])
-
-#         if retrieved_texts:
-#             return {"messages": trimmed_messages + [AIMessage(content=f"I recall our past chats:\n{retrieved_texts}")]}
-#         else:
-#             return {"messages": trimmed_messages + [AIMessage(content="I don't seem to have past records.")]}
-
-#     # Streaming Chatbot Response
-#     print("\n🤖 Chatbot:", end=" ", flush=True)
-#     response_text = ""
-
-#     async for chunk in model.astream(trimmed_messages):
-#         print(chunk.content, end="", flush=True)  # Stream response word by word
-#         response_text += chunk.content  # Store the final response
-
-#     print("\n")  # Newline after response finishes
-
-#     # Store final response in chat history & return
-#     response = AIMessage(content=response_text)
-
-#     return {"messages": trimmed_messages + [response]}  # Append response to chat history
 
 async def call_model(state: MessagesState):
     """Handles chatbot response asynchronously using the REACT agent with real-time streaming."""
@@ -180,7 +140,7 @@ async def call_model(state: MessagesState):
     # Check if user asks for past conversations
     if "recall" in latest_query.lower() or "remember" in latest_query.lower():
         user_id = state.get("user_id", "default_user")  # Get user ID
-        past_chats = get_recent_past_conversations(user_id, limit=10)  # Fetch last 10 interactions
+        past_chats = get_recent_past_conversations(user_id, limit=3)  # Fetch last 10 interactions
         retrieved_texts = "\n".join([f"User: {msg} | Bot: {resp}" for msg, resp in past_chats])
 
         if retrieved_texts:
@@ -201,7 +161,7 @@ async def call_model(state: MessagesState):
     # Store final response in chat history & return
     response = AIMessage(content=response_text)
 
-    # ✅ Save interaction to the database
+    # Save interaction to the database
     user_id = state.get("user_id", "default_user")  
     save_to_db(user_id, latest_query, response_text)  # Save convo
 
@@ -246,25 +206,26 @@ async def chat():
         async for chunk in app.astream(
             {"messages": user_conversations[user_id]},
             {
-                "thread_id": user_id,  # ✅ Required
-                "checkpoint_ns": "chatbot",  # ✅ Add a static namespace
-                "checkpoint_id": f"{user_id}_{len(user_conversations[user_id])}"  # ✅ Unique ID per turn
+                "thread_id": user_id,  # Required
+                "checkpoint_ns": "chatbot",  # Add a static namespace
+                "checkpoint_id": f"{user_id}_{len(user_conversations[user_id])}"  # Unique ID per turn
             }
         ):
             # chunk_content = chunk["messages"][-1].content  
             # print(chunk_content, end="", flush=True)  # Streaming response
             # response_text += chunk_content 
-            
-            # ✅ Only access "messages" if it's present
+            # ✅ Handle different chunk formats
+            chunk_content = chunk.get("messages", [{}])[-1].get("content", "") or chunk.get("text", "")
+
+            # Only access "messages" if it's present
             if "messages" in chunk:
                 chunk_content = chunk["messages"][-1].content
             elif "text" in chunk:  
-                chunk_content = chunk["text"]  # ✅ If it's raw text, use that instead
+                chunk_content = chunk["text"]  # If it's raw text, use that instead
             else:
                 chunk_content = str(chunk)  # Convert chunk to string as a fallback
 
-            print(chunk_content, end="", flush=True)  # ✅ Stream output live
-            response_text += chunk_content  # ✅ Collect full response 
+            response_text += chunk_content  # Collect full response 
 
         print("\n")  # Newline after response finishes
 
@@ -272,7 +233,6 @@ async def chat():
         chatbot_response = AIMessage(content=response_text)
         user_conversations[user_id].append(chatbot_response)
         save_to_db(user_id, query, response_text)  # Store in SQLite
-
 
 # Run the chatbot asynchronously
 asyncio.run(chat())
