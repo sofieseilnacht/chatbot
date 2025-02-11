@@ -46,44 +46,97 @@ vector_store.save_local("faiss_index")  # Optional: Save for persistence
 # Define a transformer to summarize past conversation data
 summarizer = StrOutputParser()
 
+# Set up embeddings storage for chat history
+def store_chat_embedding(message):
+    embedding = embeddings.embed_query(message)  # Convert text to vector
+    cursor.execute("UPDATE chat_history SET embedding = ? WHERE message = ?", (embedding, message))
+    conn.commit()
+
 # Set up Tavily Search
-tavily_tool = TavilySearchResults(
+tavily = TavilySearchResults(
     max_results=5,
     search_depth="advanced",
     include_answer=True,
     include_raw_content=True,
-    include_images=True
-)
+    include_images=True)
 
 # Wrap Tavily as a LangChain tool
-search_tool = Tool(
-    name="Web Search",
-    func=tavily_tool.invoke,
-    description="Search the web for real-time information."
-)
+def search_tavily(query: str) -> str:
+    """Search Tavily and return a summary of the topic."""
+    search_results = tavily.invoke(query)
+
+    if search_results:
+        return f"🌐 **Source: Web Search (Tavily)**\n\n{search_results}"
+    else:
+        return "🌐 **Source: Web Search (Tavily)**\n\nNo relevant web results found."
+
+def retrieve_from_faiss(query):
+    """Retrieve relevant document chunks from FAISS."""
+    vector_store = FAISS.load_local("faiss_index", embeddings)
+    search_results = vector_store.similarity_search(query, k=3)
+
+    if  search_results:
+        return f"📄 **Source: Retrieved from Documents**\n\n" + "\n".join([doc.page_content for doc in search_results])
+    else:
+        return "📄 **Source: Retrieved from Documents**\n\nNo relevant documents found."
 
 # Wikipedia Search (Only when explicitly mentioned)
-def search_wikipedia(query):
-    """Search Wikipedia only if 'Wikipedia' is mentioned in the query."""
-    if "wikipedia" not in query.lower():
-        return None  # Do nothing if Wikipedia isn't mentioned
-
-    clean_query = query.lower().replace("wikipedia", "").strip()
-    wiki = wikipediaapi.Wikipedia(language="en", user_agent="MyChatbot/1.0 (sofie.seilnacht@berkeley.edu)")
-    page = wiki.page(clean_query)
+def search_wikipedia(query: str) -> str:
+    """Search Wikipedia and return a summary of the topic."""
+    wiki = wikipediaapi.Wikipedia(language="en", user_agent="MyChatbot/1.0")
+    page = wiki.page(query)
 
     if page.exists():
-        print("\n🌍 Wikipedia Search Found:\n", page.summary[:750])
-        return page.summary[:750]  # Return first 750 characters
+        return f"🌍 **Source: Wikipedia**\n\n{page.summary[:750]}"
     else:
-        print("\n⚠️ No Wikipedia article found for:", clean_query)
-        return "Sorry, no Wikipedia article found on that topic."
+        return "🌍 **Source: Wikipedia**\n\nNo Wikipedia article found."
+
+def retrieve_relevant_chat(query: str) -> str:
+    """Retrieve the most relevant past chat logs using vector similarity search."""
+    query_embedding = embeddings.embed_query(query)  # Convert query to vector
+    
+    # Retrieve top 3 relevant past chats using FAISS or a vector database
+    results = vector_store.similarity_search_by_vector(query_embedding, k=3)
+
+    if results:
+        return f"💾 **Source: Chat Memory**\n\n" + "\n".join([msg.page_content for msg in results])
+    else:
+        return "💾 **Source: Chat Memory**\n\nNo relevant past information found."
+
+def auto_retrieve_past_info(query):
+    """Automatically retrieve past relevant chat history."""
+    past_info = retrieve_relevant_chat(query)  # Fetch relevant past logs
+    
+    if past_info:
+        return f"💾 **Using past conversations:**\n{past_info}\n\n{query}"
+    else:
+        return query  # If no past data is relevant, just use the query
+
+# Wrap FAISS retrieval as a LangChain tool
+tavily_tool = Tool(
+    name="Web Search",
+    func=lambda query: search_tavily(query),
+    description="Retrieve real-time web information.")
+
+faiss_tool = Tool(
+    name="FAISS Document Search",
+    func=lambda query: retrieve_from_faiss(query),
+    description="Retrieve relevant information from stored documents.")
+
+wikipedia_tool = Tool(
+    name="Wikipedia Search",
+    func=lambda query: search_wikipedia(query),
+    description="Retrieve factual summaries from Wikipedia.")
+
+chat_memory_tool = Tool(
+    name="Chat Memory Retrieval",
+    func=retrieve_relevant_chat,
+    description="Retrieve relevant past user conversations to enhance responses.")
 
 # Create REACT Agent (Decides which tool to use)
 agent = create_react_agent(
     model,
-    tools=[search_tool]  # Add more tools like FAISS or Wikipedia if needed
-)
+    tools=[tavily_tool, faiss_tool, wikipedia_tool, chat_memory_tool])
 
 # Define conversation memory per user
 user_conversations = {}
@@ -95,8 +148,7 @@ trimmer = trim_messages(
     token_counter=model,
     include_system=True,
     allow_partial=False,
-    start_on="human",
-)
+    start_on="human",)
 
 # Connect to SQLite database (or create it if it doesn't exist)
 conn = sqlite3.connect("chat_memory.db")
@@ -108,93 +160,154 @@ CREATE TABLE IF NOT EXISTS chat_history (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id TEXT,
     message TEXT,
-    response TEXT
-)
-""")
+    response TEXT)""")
 conn.commit()
 
-def get_recent_past_conversations(user_id, limit=10):
-    """Fetch the last 'limit' messages from the database, excluding recall requests."""
+# def get_recent_past_conversations(user_id, limit=10):
+#     """Fetch the last 'limit' messages from the database, excluding recall requests."""
     
-    # Debug: Print the query being executed
-    print(f"Retrieving last {limit} messages for user: {user_id}")
+#     # Debug: Print the query being executed
+#     print(f"Retrieving last {limit} messages for user: {user_id}")
 
-    cursor.execute("""
-        SELECT message, response FROM chat_history
-        WHERE user_id = ? 
-        ORDER BY id DESC
-        LIMIT ?
-    """, (user_id, int(limit)))  # Ensure limit is an integer
+#     cursor.execute("""
+#         SELECT message, response FROM chat_history
+#         WHERE user_id = ? 
+#         ORDER BY id DESC
+#         LIMIT ?
+#     """, (user_id, int(limit)))  # Ensure limit is an integer
     
-    results = cursor.fetchall()
+#     results = cursor.fetchall()
 
-    # 🔹 Filter out messages where the user input contains "recall" (case-insensitive)
-    filtered_results = [msg for msg in results if "recall" not in msg[0].lower()]
+#     # 🔹 Filter out messages where the user input contains "recall" (case-insensitive)
+#     filtered_results = [msg for msg in results if "recall" not in msg[0].lower()]
 
-    # Get only the last `limit` messages **after filtering** to ensure correct count
-    final_results = filtered_results[-limit:]
+#     # Get only the last `limit` messages **after filtering** to ensure correct count
+#     final_results = filtered_results[-limit:]
 
-    return final_results
+#     return final_results
 
 
 def save_to_db(user_id, message, response):
-    """Stores user messages and chatbot responses in SQLite."""
+    """Stores user messages, response, and embeddings in SQLite."""
+    
+    # Insert message & response into the table first (embedding set as NULL initially)
     cursor.execute("""
-        INSERT INTO chat_history (user_id, message, response)
-        VALUES (?, ?, ?)
+        INSERT INTO chat_history (user_id, message, response, embedding)
+        VALUES (?, ?, ?, NULL)
     """, (user_id, message, response))
     conn.commit()
 
+    # Generate embedding for the message
+    embedding = embeddings.embed_query(message)  # Convert text to vector
+
+    # Store the embedding in the correct row
+    cursor.execute("""
+        UPDATE chat_history SET embedding = ? WHERE user_id = ? AND message = ?
+    """, (embedding, user_id, message))
+    conn.commit()
 
 async def call_model(state: MessagesState):
-    """Handles chatbot response asynchronously using the REACT agent with real-time streaming."""
-
-    # Trim messages to prevent token overload
-    trimmed_messages = trimmer.invoke(state["messages"])
+    """Handles chatbot response asynchronously using the REACT agent with chat memory as a tool."""
     
-    # Extract latest user query
+    trimmed_messages = trimmer.invoke(state["messages"])
     latest_query = trimmed_messages[-1].content  
 
-    # Handle Recall Requests ONLY When Necessary
-    if any(keyword in latest_query.lower() for keyword in ["recall", "remember", "look back"]):
-        user_id = state.get("user_id", "default_user")  # Get user ID
-        past_chats = get_recent_past_conversations(user_id, limit=10)  # Only fetch last 10 messages
+    # Invoke the agent (it decides if retrieval is needed)
+    agent_response = agent.invoke([HumanMessage(content=latest_query)])
 
-        if past_chats:
-            # Convert past messages into a formatted summary
-            chat_history_text = "\n".join([f"User: {msg} | Bot: {resp}" for msg, resp in past_chats])
-            summary = summarizer.parse(f"Summarize user past interactions and provide a direct answer:\n{chat_history_text}")
-            
-            # Modify query to reflect the recall summary, ensuring a **direct answer**
-            query = f"Based on this summary: {summary}, {latest_query}"
-        else:
-            return {"messages": trimmed_messages + [AIMessage(content="I don't seem to have past records.")]}  # Early return if no records exist
-
+    # Determine if retrieval happened
+    if isinstance(agent_response, str):
+        retrieved_info = agent_response  # Normal chat response
+        source_text = None  # No retrieval source
     else:
-        # If no recall is requested, process query as usual
-        query = latest_query  # Keep the original input
+        retrieved_info = agent_response.get("content", "No relevant information found.")
+        source_text = agent_response.get("source", None)  # Set to None if not found
 
-    # Streaming Chatbot Response
-    print("\n🤖 Chatbot:", end=" ", flush=True)
-    response_text = ""
+    # Only print retrieval info if a tool was used
+    if source_text:
+        print("\n🔍 Selecting the best retrieval method...\n", flush=True)
+        print(f"\n{source_text}\n", flush=True)
 
-    async for chunk in model.astream(trimmed_messages + [HumanMessage(content=query)]):
-        if hasattr(chunk, "content"):  # Check if 'chunk' has a 'content' attribute
-            chunk_content = chunk.content  # Directly access 'content'
-        else:
-            chunk_content = ""
+    # Send response to LLM (whether it’s retrieval-based or normal conversation)
+    async for chunk in model.astream(trimmed_messages + [HumanMessage(content=retrieved_info)]):
+        print(chunk.content, end="", flush=True)
 
-        if chunk_content:
-            print(chunk_content, end="", flush=True)  # Stream response
-            response_text += chunk_content  # Collect response text
+# async def call_model(state: MessagesState):
+#     """Handles chatbot response asynchronously using the REACT agent with chat memory as a tool."""
+
+#     trimmed_messages = trimmer.invoke(state["messages"])
+#     latest_query = trimmed_messages[-1].content  
+
+#     print("\n🔍 Selecting the best retrieval method...\n", flush=True)
+
+#     # Invoke the agent, which decides if past chat retrieval is needed
+#     agent_response = agent.invoke([HumanMessage(content=latest_query)])
+
+#     # Extract the tool's response
+#     if isinstance(agent_response, str):
+#         retrieved_info = agent_response  # If response is just a string
+#         source_text = "🔍 Just chatting"
+#     else:
+#         retrieved_info = agent_response.get("content", "No relevant information found.")
+#         source_text = agent_response.get("source", "🔍 **Source: Chat Memory**")
+
+#     # Print source before chatbot response
+#     print(f"\n{source_text}\n", flush=True)
+
+#     # Send retrieved info to LLM for final response
+#     print("\n🤖 Chatbot:", end=" ", flush=True)
+#     async for chunk in model.astream(trimmed_messages + [HumanMessage(content=retrieved_info)]):
+#         print(chunk.content, end="", flush=True)
+
+# async def call_model(state: MessagesState):
+#     """Handles chatbot response asynchronously using the REACT agent with real-time streaming."""
+
+#     # Trim messages to prevent token overload
+#     trimmed_messages = trimmer.invoke(state["messages"])
+    
+#     # Extract latest user query
+#     latest_query = trimmed_messages[-1].content  
+
+#     # Handle Recall Requests ONLY When Necessary
+#     if any(keyword in latest_query.lower() for keyword in ["recall", "remember", "look back"]):
+#         user_id = state.get("user_id", "default_user")  # Get user ID
+#         past_chats = get_recent_past_conversations(user_id, limit=10)  # Only fetch last 10 messages
+
+#         if past_chats:
+#             # Convert past messages into a formatted summary
+#             chat_history_text = "\n".join([f"User: {msg} | Bot: {resp}" for msg, resp in past_chats])
+#             summary = summarizer.parse(f"Summarize user past interactions and provide a direct answer:\n{chat_history_text}")
+            
+#             # Modify query to reflect the recall summary, ensuring a **direct answer**
+#             query = f"Based on this summary: {summary}, {latest_query}"
+#         else:
+#             return {"messages": trimmed_messages + [AIMessage(content="I don't seem to have past records.")]}  # Early return if no records exist
+
+#     else:
+#         # If no recall is requested, process query as usual
+#         query = latest_query  # Keep the original input
+
+#     # Streaming Chatbot Response
+#     print("\n🤖 Chatbot:", end=" ", flush=True)
+#     response_text = ""
+
+#     async for chunk in model.astream(trimmed_messages + [HumanMessage(content=query)]):
+#         if hasattr(chunk, "content"):  # Check if 'chunk' has a 'content' attribute
+#             chunk_content = chunk.content  # Directly access 'content'
+#         else:
+#             chunk_content = ""
+
+#         if chunk_content:
+#             print(chunk_content, end="", flush=True)  # Stream response
+#             response_text += chunk_content  # Collect response text
 
 
-    print("\n")  # Newline after response finishes
+#     print("\n")  # Newline after response finishes
 
-    # Store final response in chat history & return
-    response = AIMessage(content=response_text.strip())
+#     # Store final response in chat history & return
+#     response = AIMessage(content=response_text.strip())
 
-    return {"messages": trimmed_messages + [response]}  # Append response to chat history
+#     return {"messages": trimmed_messages + [response]}  # Append response to chat history
 
 workflow = StateGraph(state_schema=MessagesState)
 workflow.add_node("model", call_model)
