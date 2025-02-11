@@ -98,7 +98,6 @@ def save_embedding_in_faiss(user_id, message):
     vector_store_chat.save_local("faiss_chat_memory")
     print("✅ DEBUG: Message saved successfully:", message)
 
-
 # Set up Tavily Search
 tavily = TavilySearchResults(
     max_results=5,
