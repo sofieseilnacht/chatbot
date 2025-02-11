@@ -1,6 +1,7 @@
 import os
 import asyncio
 import wikipediaapi
+import numpy as np
 from dotenv import load_dotenv
 
 # LangChain & OpenAI
@@ -33,6 +34,9 @@ os.environ["TAVILY_API_KEY"] = os.getenv("TAVILY_API_KEY")
 # Load OpenAI model
 model = ChatOpenAI(model="gpt-4o-mini", openai_api_key=os.getenv("OPENAI_API_KEY"))
 
+# Define a transformer to summarize past conversation data
+summarizer = StrOutputParser()
+
 # Load and process documents (FAISS Vector Store)
 pdf_loader = PyPDFLoader("testRAG.pdf")
 text_splitter = CharacterTextSplitter(chunk_size=512, chunk_overlap=50)
@@ -40,17 +44,46 @@ docs = text_splitter.split_documents(pdf_loader.load())
 
 # Create FAISS vector store
 embeddings = OpenAIEmbeddings()
-vector_store = FAISS.from_documents(docs, embeddings)
-vector_store.save_local("faiss_index")  # Optional: Save for persistence
 
-# Define a transformer to summarize past conversation data
-summarizer = StrOutputParser()
+if os.path.exists("faiss_index"):
+    vector_store_docs = FAISS.load_local("faiss_index", embeddings, allow_dangerous_deserialization=True)
+else:
+    vector_store_docs = FAISS.from_documents(docs, embeddings)  # Create if missing
+    vector_store_docs.save_local("faiss_index")  # Save it to disk
 
-# Set up embeddings storage for chat history
-def store_chat_embedding(message):
-    embedding = embeddings.embed_query(message)  # Convert text to vector
-    cursor.execute("UPDATE chat_history SET embedding = ? WHERE message = ?", (embedding, message))
-    conn.commit()
+if os.path.exists("faiss_chat_memory"):
+    vector_store_chat = FAISS.load_local("faiss_chat_memory", embeddings, allow_dangerous_deserialization=True)
+else:
+    # Create FAISS with a placeholder entry (FAISS requires at least one embedding to initialize)
+    placeholder_text = ["This is a placeholder entry to initialize FAISS."]
+    vector_store_chat = FAISS.from_texts(placeholder_text, embeddings)
+    vector_store_chat.save_local("faiss_chat_memory")  # Save for future use
+
+
+def add_documents_to_faiss(new_docs):
+    """Adds new documents to the FAISS index and updates it."""
+    global vector_store_docs  # Ensure we're updating the global FAISS index
+
+    # Convert new docs into FAISS-compatible format
+    new_vector_store = FAISS.from_documents(new_docs, embeddings)  
+
+    # Merge new docs into existing FAISS index
+    vector_store_docs.merge_from(new_vector_store)
+
+    # Save updated FAISS index
+    vector_store_docs.save_local("faiss_index")
+    print("New documents added and FAISS index updated.")
+
+def save_embedding_in_faiss(user_id, message):
+    """Stores message embeddings in FAISS for fast retrieval (separate from document FAISS)."""
+    embedding = np.array(embeddings.embed_query(message))  # ✅ Ensure it's a NumPy array
+    
+    # Store chat embeddings in the chat-specific FAISS index
+    vector_store_chat.add_texts([message], embeddings=[embedding], metadatas=[{"user_id": user_id}])
+
+    # Save chat memory index
+    vector_store_chat.save_local("faiss_chat_memory")
+
 
 # Set up Tavily Search
 tavily = TavilySearchResults(
@@ -64,18 +97,15 @@ tavily = TavilySearchResults(
 def search_tavily(query: str) -> str:
     """Search Tavily and return a summary of the topic."""
     search_results = tavily.invoke(query)
-
     if search_results:
         return f"🌐 **Source: Web Search (Tavily)**\n\n{search_results}"
     else:
         return "🌐 **Source: Web Search (Tavily)**\n\nNo relevant web results found."
 
 def retrieve_from_faiss(query):
-    """Retrieve relevant document chunks from FAISS."""
-    vector_store = FAISS.load_local("faiss_index", embeddings)
-    search_results = vector_store.similarity_search(query, k=3)
-
-    if  search_results:
+    """Retrieve relevant document chunks from FAISS (without reloading every time)."""
+    search_results = vector_store_docs.similarity_search(query, k=3)  # Use global FAISS index
+    if search_results:
         return f"📄 **Source: Retrieved from Documents**\n\n" + "\n".join([doc.page_content for doc in search_results])
     else:
         return "📄 **Source: Retrieved from Documents**\n\nNo relevant documents found."
@@ -85,53 +115,43 @@ def search_wikipedia(query: str) -> str:
     """Search Wikipedia and return a summary of the topic."""
     wiki = wikipediaapi.Wikipedia(language="en", user_agent="MyChatbot/1.0")
     page = wiki.page(query)
-
     if page.exists():
         return f"🌍 **Source: Wikipedia**\n\n{page.summary[:750]}"
     else:
         return "🌍 **Source: Wikipedia**\n\nNo Wikipedia article found."
 
-def retrieve_relevant_chat(query: str) -> str:
-    """Retrieve the most relevant past chat logs using vector similarity search."""
-    query_embedding = embeddings.embed_query(query)  # Convert query to vector
+def retrieve_relevant_chat(query):
+    """Finds the most relevant past messages using FAISS (chat memory, NOT documents)."""
+    query_embedding = embeddings.embed_query(query)  # Convert input to vector
     
-    # Retrieve top 3 relevant past chats using FAISS or a vector database
-    results = vector_store.similarity_search_by_vector(query_embedding, k=3)
-
+    # Retrieve top 3 most similar past chat messages
+    results = vector_store_chat.similarity_search_by_vector(query_embedding, k=3)
     if results:
-        return f"💾 **Source: Chat Memory**\n\n" + "\n".join([msg.page_content for msg in results])
+        retrieved_info = "\n".join([doc.page_content for doc in results])
+        return f"💾 **Source: Chat Memory**\n\n{retrieved_info}\n\n🔍 **New Query:** {query}"
     else:
-        return "💾 **Source: Chat Memory**\n\nNo relevant past information found."
-
-def auto_retrieve_past_info(query):
-    """Automatically retrieve past relevant chat history."""
-    past_info = retrieve_relevant_chat(query)  # Fetch relevant past logs
-    
-    if past_info:
-        return f"💾 **Using past conversations:**\n{past_info}\n\n{query}"
-    else:
-        return query  # If no past data is relevant, just use the query
+        return "💾 **Source: Chat Memory**\n\nNo relevant past conversations found.\n\n🔍 **New Query:** " + query
 
 # Wrap FAISS retrieval as a LangChain tool
 tavily_tool = Tool(
-    name="Web Search",
+    name="Web_Search",
     func=lambda query: search_tavily(query),
     description="Retrieve real-time web information.")
 
 faiss_tool = Tool(
-    name="FAISS Document Search",
+    name="FAISS_Document_Search",
     func=lambda query: retrieve_from_faiss(query),
     description="Retrieve relevant information from stored documents.")
 
 wikipedia_tool = Tool(
-    name="Wikipedia Search",
+    name="Wikipedia_Search",
     func=lambda query: search_wikipedia(query),
     description="Retrieve factual summaries from Wikipedia.")
 
 chat_memory_tool = Tool(
-    name="Chat Memory Retrieval",
-    func=retrieve_relevant_chat,
-    description="Retrieve relevant past user conversations to enhance responses.")
+    name="Chat_Memory_Retrieval",
+    func=lambda query: retrieve_relevant_chat(query),  # Ensure function receives query correctly
+    description="Retrieve relevant past user conversations from FAISS to enhance responses.")
 
 # Create REACT Agent (Decides which tool to use)
 agent = create_react_agent(
@@ -163,163 +183,56 @@ CREATE TABLE IF NOT EXISTS chat_history (
     response TEXT)""")
 conn.commit()
 
-# def get_recent_past_conversations(user_id, limit=10):
-#     """Fetch the last 'limit' messages from the database, excluding recall requests."""
-    
-#     # Debug: Print the query being executed
-#     print(f"Retrieving last {limit} messages for user: {user_id}")
-
-#     cursor.execute("""
-#         SELECT message, response FROM chat_history
-#         WHERE user_id = ? 
-#         ORDER BY id DESC
-#         LIMIT ?
-#     """, (user_id, int(limit)))  # Ensure limit is an integer
-    
-#     results = cursor.fetchall()
-
-#     # 🔹 Filter out messages where the user input contains "recall" (case-insensitive)
-#     filtered_results = [msg for msg in results if "recall" not in msg[0].lower()]
-
-#     # Get only the last `limit` messages **after filtering** to ensure correct count
-#     final_results = filtered_results[-limit:]
-
-#     return final_results
-
-
 def save_to_db(user_id, message, response):
-    """Stores user messages, response, and embeddings in SQLite."""
+    """Stores user messages and responses in SQLite (without embeddings)."""
     
-    # Insert message & response into the table first (embedding set as NULL initially)
     cursor.execute("""
-        INSERT INTO chat_history (user_id, message, response, embedding)
-        VALUES (?, ?, ?, NULL)
+        INSERT INTO chat_history (user_id, message, response)
+        VALUES (?, ?, ?)
     """, (user_id, message, response))
-    conn.commit()
-
-    # Generate embedding for the message
-    embedding = embeddings.embed_query(message)  # Convert text to vector
-
-    # Store the embedding in the correct row
-    cursor.execute("""
-        UPDATE chat_history SET embedding = ? WHERE user_id = ? AND message = ?
-    """, (embedding, user_id, message))
     conn.commit()
 
 async def call_model(state: MessagesState):
     """Handles chatbot response asynchronously using the REACT agent with chat memory as a tool."""
-    
     trimmed_messages = trimmer.invoke(state["messages"])
     latest_query = trimmed_messages[-1].content  
 
-    # Invoke the agent (it decides if retrieval is needed)
-    agent_response = agent.invoke([HumanMessage(content=latest_query)])
-
-    # Determine if retrieval happened
-    if isinstance(agent_response, str):
-        retrieved_info = agent_response  # Normal chat response
-        source_text = None  # No retrieval source
-    else:
-        retrieved_info = agent_response.get("content", "No relevant information found.")
-        source_text = agent_response.get("source", None)  # Set to None if not found
-
-    # Only print retrieval info if a tool was used
-    if source_text:
-        print("\n🔍 Selecting the best retrieval method...\n", flush=True)
-        print(f"\n{source_text}\n", flush=True)
-
-    # Send response to LLM (whether it’s retrieval-based or normal conversation)
-    async for chunk in model.astream(trimmed_messages + [HumanMessage(content=retrieved_info)]):
-        print(chunk.content, end="", flush=True)
-
-# async def call_model(state: MessagesState):
-#     """Handles chatbot response asynchronously using the REACT agent with chat memory as a tool."""
-
-#     trimmed_messages = trimmer.invoke(state["messages"])
-#     latest_query = trimmed_messages[-1].content  
-
-#     print("\n🔍 Selecting the best retrieval method...\n", flush=True)
-
-#     # Invoke the agent, which decides if past chat retrieval is needed
-#     agent_response = agent.invoke([HumanMessage(content=latest_query)])
-
-#     # Extract the tool's response
-#     if isinstance(agent_response, str):
-#         retrieved_info = agent_response  # If response is just a string
-#         source_text = "🔍 Just chatting"
-#     else:
-#         retrieved_info = agent_response.get("content", "No relevant information found.")
-#         source_text = agent_response.get("source", "🔍 **Source: Chat Memory**")
-
-#     # Print source before chatbot response
-#     print(f"\n{source_text}\n", flush=True)
-
-#     # Send retrieved info to LLM for final response
-#     print("\n🤖 Chatbot:", end=" ", flush=True)
-#     async for chunk in model.astream(trimmed_messages + [HumanMessage(content=retrieved_info)]):
-#         print(chunk.content, end="", flush=True)
-
-# async def call_model(state: MessagesState):
-#     """Handles chatbot response asynchronously using the REACT agent with real-time streaming."""
-
-#     # Trim messages to prevent token overload
-#     trimmed_messages = trimmer.invoke(state["messages"])
+    try:
+        # 🔍 Invoke the agent (Handles RAG retrieval & normal chat)
+        agent_response = agent.invoke({"messages": [HumanMessage(content=latest_query)]})
+    except Exception as e:
+        print(f"\n❌ ERROR: `agent.invoke()` failed!\n{e}\n")
+        return {"messages": trimmed_messages + [AIMessage(content="Sorry, an error occurred.")]}
     
-#     # Extract latest user query
-#     latest_query = trimmed_messages[-1].content  
+    # Extract the AI's response from the dictionary
+    retrieved_info = ""
+    if isinstance(agent_response, dict) and "messages" in agent_response:
+        messages_list = agent_response["messages"]
 
-#     # Handle Recall Requests ONLY When Necessary
-#     if any(keyword in latest_query.lower() for keyword in ["recall", "remember", "look back"]):
-#         user_id = state.get("user_id", "default_user")  # Get user ID
-#         past_chats = get_recent_past_conversations(user_id, limit=10)  # Only fetch last 10 messages
+        for msg in messages_list:
+            if isinstance(msg, AIMessage):
+                retrieved_info = msg.content  # Extract AI's response
 
-#         if past_chats:
-#             # Convert past messages into a formatted summary
-#             chat_history_text = "\n".join([f"User: {msg} | Bot: {resp}" for msg, resp in past_chats])
-#             summary = summarizer.parse(f"Summarize user past interactions and provide a direct answer:\n{chat_history_text}")
-            
-#             # Modify query to reflect the recall summary, ensuring a **direct answer**
-#             query = f"Based on this summary: {summary}, {latest_query}"
-#         else:
-#             return {"messages": trimmed_messages + [AIMessage(content="I don't seem to have past records.")]}  # Early return if no records exist
-
-#     else:
-#         # If no recall is requested, process query as usual
-#         query = latest_query  # Keep the original input
-
-#     # Streaming Chatbot Response
-#     print("\n🤖 Chatbot:", end=" ", flush=True)
-#     response_text = ""
-
-#     async for chunk in model.astream(trimmed_messages + [HumanMessage(content=query)]):
-#         if hasattr(chunk, "content"):  # Check if 'chunk' has a 'content' attribute
-#             chunk_content = chunk.content  # Directly access 'content'
-#         else:
-#             chunk_content = ""
-
-#         if chunk_content:
-#             print(chunk_content, end="", flush=True)  # Stream response
-#             response_text += chunk_content  # Collect response text
+        if not retrieved_info:  # If no AIMessage found, use fallback
+            print("⚠️ No AIMessage found. Using fallback response.")
+            retrieved_info = "I'm not sure how to respond to that."
+    else:
+        print("⚠️ Invalid response format from agent.")
+        retrieved_info = "Invalid response format from agent."
+    return {"messages": trimmed_messages + [AIMessage(content=retrieved_info.strip())]}
 
 
-#     print("\n")  # Newline after response finishes
-
-#     # Store final response in chat history & return
-#     response = AIMessage(content=response_text.strip())
-
-#     return {"messages": trimmed_messages + [response]}  # Append response to chat history
-
+# Define the chatbot workflow
 workflow = StateGraph(state_schema=MessagesState)
 workflow.add_node("model", call_model)
 workflow.add_edge(START, "model")
 
-# Explicitly define required keys
+# Set up conversation memory
 memory = MemorySaver()
 app = workflow.compile(checkpointer=memory)
 
 async def chat():
     """Runs an interactive chatbot session in the terminal with user tracking."""
-    
     # Ask for user ID
     user_id = input("\nEnter your user ID: ").strip()
     if user_id.lower() == "bye":
@@ -331,58 +244,19 @@ async def chat():
         user_conversations[user_id] = []
 
     print(f"\n💬 {user_id}, your chatbot session has started! Type 'bye' to stop.\n")
-
+    
     while True:
         query = input(f"{user_id}: ").strip()
         if query.lower() == "bye":
             print(f"\n👋 Chatbot session ended for {user_id}. Goodbye!\n")
             break
 
-        user_conversations[user_id].append(HumanMessage(content=query))
-        response_text = ""  # Always initialize before using
+        user_conversations[user_id].append(HumanMessage(content=query))  # Append user query
+        response_text = ""  # Always initialize response before using
 
-        # Check if query requires recall (only then access database) 
-        if any(keyword in query.lower() for keyword in ["recall", "remember"]):
-            try:
-                past_chats = get_recent_past_conversations(user_id, limit=10)  
+        # Start chatbot response
+        print("\n🤖 Chatbot:", end=" ", flush=True)
 
-                if past_chats:
-                    chat_history_text = "\n".join([f"User: {msg} | Bot: {resp}" for msg, resp in past_chats])
-
-                    # Generate a **direct answer** based on past conversation
-                    recall_prompt = f"""
-                    The user wants to recall past conversations. 
-                    Here are the last few exchanges:
-                    
-                    {chat_history_text}
-
-                    User's latest question: "{query}"
-
-                    🔹 Answer clearly and concisely, referencing past interactions. 
-                    🔹 If the user's query is about their age, location, or facts about themselves, return an exact answer.
-                    🔹 DO NOT summarize vaguely—give a factual answer.
-                    """
-
-                    response = model.invoke([HumanMessage(content=recall_prompt)])  # Force direct response
-                    response_text = response.content.strip()
-
-                    print(f"\n🔍 Recall Triggered. Using past memory for response.\n")
-                    print(f"\n🤖 Chatbot: {response_text}\n")  # Print response immediately
-
-                    chatbot_response = AIMessage(content=response_text)
-                    user_conversations[user_id].append(chatbot_response)
-                    save_to_db(user_id, query, chatbot_response.content)  
-                    continue  # Skip normal chatbot flow after recall
-
-                else:
-                    print("\n🤖 Chatbot: I don't seem to have past records.\n")
-                    continue  
-
-            except Exception as e:
-                print(f"\n⚠️ Error fetching past conversations: {str(e)}\n")
-                continue  
-
-        # NORMAL CHATBOT FLOW (NO MEMORY LOOKUP)
         try:
             async for chunk in app.astream(
                 {"messages": user_conversations[user_id] + [HumanMessage(content=query)]},
@@ -392,21 +266,38 @@ async def chat():
                     "checkpoint_id": f"{user_id}_{len(user_conversations[user_id])}"
                 }
             ):
-                chunk_content = getattr(chunk, "content", "")  # Avoid AttributeError
 
-                if chunk_content:  
+                # Extract AI's response properly
+                if "model" in chunk and "messages" in chunk["model"]:
+                    ai_messages = chunk["model"]["messages"]  # Extract message list
+                    if ai_messages and isinstance(ai_messages[-1], AIMessage):
+                        chunk_content = ai_messages[-1].content.strip()
+                    else:
+                        chunk_content = ""  # No AIMessage found
+                else:
+                    chunk_content = ""  # Invalid chunk format
+
+                # Stream response in real-time
+                if chunk_content:
                     print(chunk_content, end="", flush=True)
-                    response_text += chunk_content  
+                    response_text += chunk_content  # Collect response for memory storage
 
+            print("\n")
         except Exception as e:
             print(f"\n⚠️ Error during response streaming: {str(e)}")
-            response_text = "Sorry, an error occurred while processing your request." 
+            response_text = "Sorry, an error occurred while processing your request."
 
-        # Store only if valid response
-        chatbot_response = AIMessage(content=response_text.strip() if response_text else "No response generated.")
+        # Handle Empty Responses
+        if not response_text.strip():
+            print("\n⚠️ WARNING: `response_text` is STILL EMPTY! Debug needed!")
+            response_text = "I didn't generate a response. Please try again."
+
+        # Store response in memory
+        chatbot_response = AIMessage(content=response_text.strip())
         user_conversations[user_id].append(chatbot_response)
-        save_to_db(user_id, query, chatbot_response.content)  
+        save_to_db(user_id, query, response_text.strip())
 
 
 # Run the chatbot asynchronously
 asyncio.run(chat())
+
