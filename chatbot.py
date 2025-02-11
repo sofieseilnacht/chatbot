@@ -79,9 +79,7 @@ def save_embedding_in_faiss(user_id, message):
 
     try:
         vector_store_chat = FAISS.load_local("faiss_chat_memory", embeddings, allow_dangerous_deserialization=True)
-        print("✅ DEBUG: FAISS Chat Memory loaded successfully.")
     except Exception:
-        print("⚠️ DEBUG: FAISS Chat Memory not found, creating a new index.")
         vector_store_chat = FAISS.from_texts(["This is a placeholder entry to initialize FAISS."], embeddings)
 
     # ✅ Check if the message is already stored
@@ -90,13 +88,11 @@ def save_embedding_in_faiss(user_id, message):
 
     for result in existing_results:
         if result.page_content.strip().lower() == message.strip().lower():
-            print("⚠️ DEBUG: Duplicate detected! Skipping storage of:", message)
             return  # Don't save if it's already in FAISS
 
     # ✅ If it's a new message, store it
     vector_store_chat.add_texts([message], embeddings=[query_embedding], metadatas=[{"user_id": user_id}])
     vector_store_chat.save_local("faiss_chat_memory")
-    print("✅ DEBUG: Message saved successfully:", message)
 
 # Set up Tavily Search
 tavily = TavilySearchResults(
@@ -140,9 +136,7 @@ def retrieve_relevant_chat(query):
     # ✅ Load FAISS chat memory from disk before querying
     try:
         vector_store_chat = FAISS.load_local("faiss_chat_memory", embeddings, allow_dangerous_deserialization=True)
-        print("✅ DEBUG: FAISS Chat Memory loaded successfully for retrieval.")
     except Exception:
-        print("⚠️ DEBUG: FAISS Chat Memory not found, returning placeholder.")
         return "💾 **Source: Chat Memory**\n\nNo relevant past conversations found."
 
     # ✅ Convert input query to vector
@@ -153,7 +147,6 @@ def retrieve_relevant_chat(query):
 
     if results:
         retrieved_info = "\n".join([f"💾 **Stored Memory:** {doc.page_content}" for doc in results])
-        print(f"🔍 DEBUG: Retrieved from FAISS chat memory - {retrieved_info}")
         return f"{retrieved_info}\n\n🔍 **New Query:** {query}"
 
     else:
@@ -220,44 +213,50 @@ def save_to_db(user_id, message, response):
     """, (user_id, message, response))
     conn.commit()
 
-
 # async def call_model(state: MessagesState):
 #     """Handles chatbot response asynchronously using the REACT agent with chat memory as a tool."""
 #     trimmed_messages = trimmer.invoke(state["messages"])
 #     latest_query = trimmed_messages[-1].content  
 
-#     # ✅ Step 1: Retrieve memory from FAISS
+#     # ✅ Retrieve past chat memory (FAISS)
 #     chat_memory_result = retrieve_relevant_chat(latest_query)
 #     is_chat_memory_used = "💾 **Stored Memory:**" in chat_memory_result  
 
-#     # ✅ Step 2: Prepare memory context
+#     # ✅ Prepare memory context only if relevant
 #     memory_context = ""
 #     if is_chat_memory_used:
-#         memory_context = f"Here is past memory that may help answer the question:\n\n{chat_memory_result}\n\n"
+#         memory_context = f"💾 **Source: Chat Memory**\n\n{chat_memory_result}\n\n"
 #         print(f"🧠 DEBUG: Passing FAISS memory into model:\n{memory_context}")  # Debugging
 
 #     try:
-#         # ✅ Step 3: Pass memory as context for model to use
+#         # ✅ Step 1: Ask the agent (includes Tavily & Wikipedia)
 #         agent_response = agent.invoke({"messages": [HumanMessage(content=memory_context + latest_query)]})
 
 #         retrieved_info = ""
+#         source_label = ""
+
 #         if isinstance(agent_response, dict) and "messages" in agent_response:
 #             messages_list = agent_response["messages"]
 #             for msg in messages_list:
 #                 if isinstance(msg, AIMessage):
-#                     retrieved_info = msg.content
+#                     retrieved_info = msg.content.strip()
 
+#         # ✅ Step 2: Determine Source (Web, FAISS, or Wikipedia)
+#         if "🌐 **Source: Web Search (Tavily)**" in retrieved_info:
+#             source_label = "🌐 Web Search:\n\n"
+#         elif "🌍 **Source: Wikipedia**" in retrieved_info:
+#             source_label = "🌍 Wikipedia:\n\n"
+#         elif is_chat_memory_used:
+#             source_label = "💾 Chat Memory:\n\n"
+
+#         # ✅ Step 3: Format final response
 #         if not retrieved_info:
 #             print("⚠️ No AIMessage found. Using fallback response.")
 #             retrieved_info = "I'm not sure how to respond to that."
 
-#         # ✅ Step 4: Append FAISS memory to response
-#         sources = []
-#         if is_chat_memory_used:
-#             sources.append(f"💾 **Source: Chat Memory**\n\n{chat_memory_result}")  
-#         print(sources)
-#         response_content = "\n\n".join(sources) + f"\n\n{retrieved_info}".strip()
-#         return {"messages": trimmed_messages + [AIMessage(content=response_content)]}
+#         final_response = f"{source_label}{retrieved_info}".strip()
+
+#         return {"messages": trimmed_messages + [AIMessage(content=final_response)]}
 
 #     except Exception as e:
 #         print(f"\n❌ ERROR: `agent.invoke()` failed!\n{e}\n")
@@ -266,51 +265,51 @@ def save_to_db(user_id, message, response):
 async def call_model(state: MessagesState):
     """Handles chatbot response asynchronously using the REACT agent with chat memory as a tool."""
     trimmed_messages = trimmer.invoke(state["messages"])
-    latest_query = trimmed_messages[-1].content  
+    latest_query = trimmed_messages[-1].content.lower()
 
-    # ✅ Retrieve past chat memory (FAISS)
+    # ✅ Retrieve relevant past chat messages
     chat_memory_result = retrieve_relevant_chat(latest_query)
-    is_chat_memory_used = "💾 **Stored Memory:**" in chat_memory_result  
+    is_chat_memory_used = "💾 **Stored Memory:**" in chat_memory_result
 
-    # ✅ Prepare memory context only if relevant
-    memory_context = ""
-    if is_chat_memory_used:
-        memory_context = f"💾 **Source: Chat Memory**\n\n{chat_memory_result}\n\n"
-        print(f"🧠 DEBUG: Passing FAISS memory into model:\n{memory_context}")  # Debugging
+    # ✅ Set memory context only if it's useful
+    memory_context = chat_memory_result if is_chat_memory_used else ""
 
+    # ✅ Let the agent decide the tool to use
     try:
-        # ✅ Step 1: Ask the agent (includes Tavily & Wikipedia)
         agent_response = agent.invoke({"messages": [HumanMessage(content=memory_context + latest_query)]})
 
         retrieved_info = ""
-        source_label = ""
-
         if isinstance(agent_response, dict) and "messages" in agent_response:
             messages_list = agent_response["messages"]
             for msg in messages_list:
                 if isinstance(msg, AIMessage):
-                    retrieved_info = msg.content.strip()
+                    retrieved_info = msg.content
 
-        # ✅ Step 2: Determine Source (Web, FAISS, or Wikipedia)
-        if "🌐 **Source: Web Search (Tavily)**" in retrieved_info:
-            source_label = "🌐 Web Search:\n\n"
-        elif "🌍 **Source: Wikipedia**" in retrieved_info:
-            source_label = "🌍 Wikipedia:\n\n"
-        elif is_chat_memory_used:
-            source_label = "💾 Chat Memory:\n\n"
-
-        # ✅ Step 3: Format final response
         if not retrieved_info:
             print("⚠️ No AIMessage found. Using fallback response.")
             retrieved_info = "I'm not sure how to respond to that."
 
-        final_response = f"{source_label}{retrieved_info}".strip()
-
-        return {"messages": trimmed_messages + [AIMessage(content=final_response)]}
-
     except Exception as e:
         print(f"\n❌ ERROR: `agent.invoke()` failed!\n{e}\n")
-        return {"messages": trimmed_messages + [AIMessage(content="Sorry, an error occurred.")]}
+        retrieved_info = "Sorry, an error occurred."
+
+    # ✅ Check which sources were actually used
+    sources = []
+    if is_chat_memory_used and any(text in retrieved_info for text in chat_memory_result.split("\n")):
+        sources.append("💾Chat Memory: ")
+    if "🌐 **Source: Web Search (Tavily)**" in retrieved_info:
+        sources.append("🌐Web Search: ")
+    if "📄 **Source: Retrieved from Documents**" in retrieved_info:
+        sources.append("📄Documents: ")
+
+    # ✅ Format the response correctly (Only include relevant sources)
+    if sources:
+        response_content = "\n\n".join(sources) + f"\n\n{retrieved_info}".strip()
+    else:
+        response_content = retrieved_info.strip()  # No unnecessary labels
+
+    return {"messages": trimmed_messages + [AIMessage(content=response_content)]}
+
 
 # Define the chatbot workflow
 workflow = StateGraph(state_schema=MessagesState)
@@ -379,7 +378,6 @@ async def chat():
             response_text = "Sorry, an error occurred while processing your request."
 
         if not response_text.strip():
-            print("\n⚠️ WARNING: `response_text` is STILL EMPTY! Debug needed!")
             response_text = "I didn't generate a response. Please try again."
 
         chatbot_response = AIMessage(content=response_text.strip())
