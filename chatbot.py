@@ -76,27 +76,26 @@ def add_documents_to_faiss(new_docs):
 
 
 def save_embedding_in_faiss(user_id, message):
-    """Stores message embeddings in FAISS chat memory and ensures retrieval works."""
+    """Stores message embeddings in FAISS chat memory and ensures retrieval works across chatbot restarts."""
     
-    # ✅ Generate an embedding for the message
-    embedding = embeddings.embed_query(message)  
-
-    # ✅ Load existing FAISS index instead of overwriting
+    # ✅ Load existing FAISS chat memory from disk (instead of overwriting it)
     try:
         vector_store_chat = FAISS.load_local("faiss_chat_memory", embeddings, allow_dangerous_deserialization=True)
-        print("✅ DEBUG: FAISS Chat Memory loaded successfully.")  # Debugging
+        print("✅ DEBUG: FAISS Chat Memory loaded successfully.")
     except Exception:
-        print("⚠️ DEBUG: FAISS Chat Memory not found, creating new index.")
+        print("⚠️ DEBUG: FAISS Chat Memory not found, creating a new index.")
         vector_store_chat = FAISS.from_texts(["This is a placeholder entry to initialize FAISS."], embeddings)
 
-    # ✅ Append new message to FAISS chat memory
+    # ✅ Generate an embedding for the new message
+    embedding = embeddings.embed_query(message)
+
+    # ✅ Append the new message to FAISS chat memory
     vector_store_chat.add_texts([message], embeddings=[embedding], metadatas=[{"user_id": user_id}])
 
-    # ✅ Save updated FAISS chat memory
+    # ✅ Save the updated FAISS chat memory so it persists across restarts
     vector_store_chat.save_local("faiss_chat_memory")
 
     print(f"✅ DEBUG: Stored in FAISS chat memory - '{message}' with embedding.")
-
 
 # Set up Tavily Search
 tavily = TavilySearchResults(
@@ -135,27 +134,27 @@ def search_wikipedia(query: str) -> str:
 
 
 def retrieve_relevant_chat(query):
-    """Retrieves relevant past messages using FAISS chat memory."""
+    """Retrieves relevant past messages using FAISS chat memory and ensures persistence across chatbot restarts."""
     
-    # ✅ Load FAISS chat memory before querying
+    # ✅ Load FAISS chat memory from disk before querying
     try:
         vector_store_chat = FAISS.load_local("faiss_chat_memory", embeddings, allow_dangerous_deserialization=True)
-        print("✅ DEBUG: FAISS Chat Memory loaded successfully for retrieval.")  # Debugging
+        print("✅ DEBUG: FAISS Chat Memory loaded successfully for retrieval.")
     except Exception:
         print("⚠️ DEBUG: FAISS Chat Memory not found, returning placeholder.")
         return "💾 **Source: Chat Memory**\n\nNo relevant past conversations found."
 
     # ✅ Convert input query to vector
     query_embedding = embeddings.embed_query(query)
-    
+
     # ✅ Retrieve top 3 most similar past chat messages
     results = vector_store_chat.similarity_search_by_vector(query_embedding, k=3)
-    
+
     if results:
         retrieved_info = "\n".join([f"💾 **Stored Memory:** {doc.page_content}" for doc in results])
-        print(f"🔍 DEBUG: Retrieved from FAISS chat memory - {retrieved_info}")  # Debugging
+        print(f"🔍 DEBUG: Retrieved from FAISS chat memory - {retrieved_info}")
         return f"{retrieved_info}\n\n🔍 **New Query:** {query}"
-    
+
     else:
         return "💾 **Source: Chat Memory**\n\nNo relevant past conversations found.\n\n🔍 **New Query:** " + query
 
@@ -221,62 +220,6 @@ def save_to_db(user_id, message, response):
     conn.commit()
 
 
-# async def call_model(state: MessagesState):
-#     """Handles chatbot response asynchronously using the REACT agent with chat memory as a tool."""
-#     trimmed_messages = trimmer.invoke(state["messages"])
-#     latest_query = trimmed_messages[-1].content  
-
-#     # ✅ Step 1: Check all RAG retrievals
-#     faiss_result = retrieve_from_faiss(latest_query)
-#     is_faiss_used = "📄" in faiss_result  
-
-#     tavily_result = search_tavily(latest_query)
-#     is_tavily_used = "🌐" in tavily_result  
-
-#     wiki_result = search_wikipedia(latest_query)
-#     is_wiki_used = "🌍" in wiki_result  
-
-#     chat_memory_result = retrieve_relevant_chat(latest_query)
-#     is_chat_memory_used = "💾 **Stored Memory:**" in chat_memory_result  
-
-#     try:
-#         # 🔍 Step 2: Let the agent process the query
-#         agent_response = agent.invoke({"messages": [HumanMessage(content=latest_query)]})
-
-#         retrieved_info = ""
-#         if isinstance(agent_response, dict) and "messages" in agent_response:
-#             messages_list = agent_response["messages"]
-#             for msg in messages_list:
-#                 if isinstance(msg, AIMessage):
-#                     retrieved_info = msg.content
-
-#         if not retrieved_info:
-#             print("⚠️ No AIMessage found. Using fallback response.")
-#             retrieved_info = "I'm not sure how to respond to that."
-
-#         # ✅ Step 3: Print debug info for FAISS Chat Memory
-#         if is_chat_memory_used:
-#             print(f"🔍 DEBUG: FAISS Chat Memory Retrieved - {chat_memory_result}")
-
-#         # ✅ Step 4: Append all used sources dynamically
-#         sources = []
-#         if is_faiss_used:
-#             sources.append(faiss_result)  
-#         if is_tavily_used:
-#             sources.append(f"🌐 **Source: Web Search (Tavily)**\n\n{tavily_result}")  
-#         if is_wiki_used:
-#             sources.append(f"🌍 **Source: Wikipedia**\n\n{wiki_result}")  
-#         if is_chat_memory_used:
-#             sources.append(f"💾 **Source: Chat Memory**\n\n{chat_memory_result}")  
-
-#         # ✅ Step 5: Construct Final Response with Sources
-#         response_content = "\n\n".join(sources) + f"\n\n{retrieved_info}".strip()
-#         return {"messages": trimmed_messages + [AIMessage(content=response_content)]}
-
-#     except Exception as e:
-#         print(f"\n❌ ERROR: `agent.invoke()` failed!\n{e}\n")
-#         return {"messages": trimmed_messages + [AIMessage(content="Sorry, an error occurred.")]}
-
 async def call_model(state: MessagesState):
     """Handles chatbot response asynchronously using the REACT agent with chat memory as a tool."""
     trimmed_messages = trimmer.invoke(state["messages"])
@@ -332,75 +275,6 @@ workflow.add_edge(START, "model")
 # Set up conversation memory
 memory = MemorySaver()
 app = workflow.compile(checkpointer=memory)
-
-# async def chat():
-#     """Runs an interactive chatbot session in the terminal with user tracking."""
-#     # Ask for user ID
-#     user_id = input("\nEnter your user ID: ").strip()
-#     if user_id.lower() == "bye":
-#         print("\n👋 Chatbot session ended. Goodbye!\n")
-#         return
-
-#     # Ensure user has a conversation history
-#     if user_id not in user_conversations:
-#         user_conversations[user_id] = []
-
-#     print(f"\n💬 {user_id}, your chatbot session has started! Type 'bye' to stop.\n")
-    
-#     while True:
-#         query = input(f"{user_id}: ").strip()
-#         if not query:  # Prevent empty input errors
-#             print("⚠️ Please enter a message.")
-#             continue
-#         if query.lower() == "bye":
-#             print(f"\n👋 Chatbot session ended for {user_id}. Goodbye!\n")
-#             break
-
-#         user_conversations[user_id].append(HumanMessage(content=query))  # Append user query
-#         response_text = ""  # Always initialize response before using
-
-#         # Start chatbot response
-#         print("\n🤖 Chatbot:", end=" ", flush=True)
-
-#         try:
-#             async for chunk in app.astream(
-#                 {"messages": user_conversations[user_id] + [HumanMessage(content=query)]},
-#                 {
-#                     "thread_id": user_id,  
-#                     "checkpoint_ns": "chatbot",  
-#                     "checkpoint_id": f"{user_id}_{len(user_conversations[user_id])}"
-#                 }
-#             ):
-
-#                 # Extract AI's response properly
-#                 if "model" in chunk and "messages" in chunk["model"]:
-#                     ai_messages = chunk["model"]["messages"]  # Extract message list
-#                     if ai_messages and isinstance(ai_messages[-1], AIMessage):
-#                         chunk_content = ai_messages[-1].content.strip()
-#                     else:
-#                         chunk_content = ""  # No AIMessage found
-#                 else:
-#                     chunk_content = ""  # Invalid chunk format
-
-#                 # Stream response in real-time
-#                 if chunk_content:
-#                     print(chunk_content, end="", flush=True)
-#                     response_text += chunk_content  # Collect response for memory storage
-
-#             print("\n")
-#         except Exception as e:
-#             print(f"\n⚠️ Error during response streaming: {str(e)}")
-#             response_text = "Sorry, an error occurred while processing your request."
-
-#         # Handle Empty Responses
-#         if not response_text.strip():
-#             print("\n⚠️ WARNING: `response_text` is STILL EMPTY! Debug needed!")
-#             response_text = "I didn't generate a response. Please try again."
-
-#         # Store response in memory
-#         chatbot_response = AIMessage(content=response_text.strip())
-#         user_conversations[user_id].append(chatbot_response)
-#         save_to_db(user_id, query, response_text.strip())
 
 async def chat():
     """Runs an interactive chatbot session in the terminal with user tracking."""
