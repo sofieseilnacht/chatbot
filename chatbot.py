@@ -74,11 +74,9 @@ def add_documents_to_faiss(new_docs):
     vector_store_docs.save_local("faiss_index")
     print("New documents added and FAISS index updated.")
 
-
 def save_embedding_in_faiss(user_id, message):
-    """Stores message embeddings in FAISS chat memory and ensures retrieval works across chatbot restarts."""
-    
-    # ✅ Load existing FAISS chat memory from disk (instead of overwriting it)
+    """Stores message embeddings in FAISS chat memory but prevents duplicates."""
+
     try:
         vector_store_chat = FAISS.load_local("faiss_chat_memory", embeddings, allow_dangerous_deserialization=True)
         print("✅ DEBUG: FAISS Chat Memory loaded successfully.")
@@ -86,16 +84,20 @@ def save_embedding_in_faiss(user_id, message):
         print("⚠️ DEBUG: FAISS Chat Memory not found, creating a new index.")
         vector_store_chat = FAISS.from_texts(["This is a placeholder entry to initialize FAISS."], embeddings)
 
-    # ✅ Generate an embedding for the new message
-    embedding = embeddings.embed_query(message)
+    # ✅ Check if the message is already stored
+    query_embedding = embeddings.embed_query(message)
+    existing_results = vector_store_chat.similarity_search_by_vector(query_embedding, k=3)
 
-    # ✅ Append the new message to FAISS chat memory
-    vector_store_chat.add_texts([message], embeddings=[embedding], metadatas=[{"user_id": user_id}])
+    for result in existing_results:
+        if result.page_content.strip().lower() == message.strip().lower():
+            print("⚠️ DEBUG: Duplicate detected! Skipping storage of:", message)
+            return  # Don't save if it's already in FAISS
 
-    # ✅ Save the updated FAISS chat memory so it persists across restarts
+    # ✅ If it's a new message, store it
+    vector_store_chat.add_texts([message], embeddings=[query_embedding], metadatas=[{"user_id": user_id}])
     vector_store_chat.save_local("faiss_chat_memory")
+    print("✅ DEBUG: Message saved successfully:", message)
 
-    print(f"✅ DEBUG: Stored in FAISS chat memory - '{message}' with embedding.")
 
 # Set up Tavily Search
 tavily = TavilySearchResults(
@@ -116,7 +118,7 @@ def search_tavily(query: str) -> str:
 
 def retrieve_from_faiss(query):
     """Retrieve relevant document chunks from FAISS (without reloading every time)."""
-    search_results = vector_store_docs.similarity_search(query, k=3)  # Use global FAISS index
+    search_results = vector_store_docs.similarity_search(query, k=1)  # Use global FAISS index
     if search_results:
         return f"📄 **Source: Retrieved from Documents**\n\n" + "\n".join([doc.page_content for doc in search_results])
     else:
@@ -163,7 +165,7 @@ def retrieve_relevant_chat(query):
 tavily_tool = Tool(
     name="Web_Search",
     func=lambda query: search_tavily(query),
-    description="Retrieve real-time web information.")
+    description="Use this tool for retrieving real-time web information, especially for recent events, politics, or current facts.",)
 
 faiss_tool = Tool(
     name="FAISS_Document_Search",
@@ -220,52 +222,96 @@ def save_to_db(user_id, message, response):
     conn.commit()
 
 
+# async def call_model(state: MessagesState):
+#     """Handles chatbot response asynchronously using the REACT agent with chat memory as a tool."""
+#     trimmed_messages = trimmer.invoke(state["messages"])
+#     latest_query = trimmed_messages[-1].content  
+
+#     # ✅ Step 1: Retrieve memory from FAISS
+#     chat_memory_result = retrieve_relevant_chat(latest_query)
+#     is_chat_memory_used = "💾 **Stored Memory:**" in chat_memory_result  
+
+#     # ✅ Step 2: Prepare memory context
+#     memory_context = ""
+#     if is_chat_memory_used:
+#         memory_context = f"Here is past memory that may help answer the question:\n\n{chat_memory_result}\n\n"
+#         print(f"🧠 DEBUG: Passing FAISS memory into model:\n{memory_context}")  # Debugging
+
+#     try:
+#         # ✅ Step 3: Pass memory as context for model to use
+#         agent_response = agent.invoke({"messages": [HumanMessage(content=memory_context + latest_query)]})
+
+#         retrieved_info = ""
+#         if isinstance(agent_response, dict) and "messages" in agent_response:
+#             messages_list = agent_response["messages"]
+#             for msg in messages_list:
+#                 if isinstance(msg, AIMessage):
+#                     retrieved_info = msg.content
+
+#         if not retrieved_info:
+#             print("⚠️ No AIMessage found. Using fallback response.")
+#             retrieved_info = "I'm not sure how to respond to that."
+
+#         # ✅ Step 4: Append FAISS memory to response
+#         sources = []
+#         if is_chat_memory_used:
+#             sources.append(f"💾 **Source: Chat Memory**\n\n{chat_memory_result}")  
+#         print(sources)
+#         response_content = "\n\n".join(sources) + f"\n\n{retrieved_info}".strip()
+#         return {"messages": trimmed_messages + [AIMessage(content=response_content)]}
+
+#     except Exception as e:
+#         print(f"\n❌ ERROR: `agent.invoke()` failed!\n{e}\n")
+#         return {"messages": trimmed_messages + [AIMessage(content="Sorry, an error occurred.")]}
+
 async def call_model(state: MessagesState):
     """Handles chatbot response asynchronously using the REACT agent with chat memory as a tool."""
     trimmed_messages = trimmer.invoke(state["messages"])
     latest_query = trimmed_messages[-1].content  
 
-    # ✅ Step 1: Retrieve memory from FAISS
+    # ✅ Retrieve past chat memory (FAISS)
     chat_memory_result = retrieve_relevant_chat(latest_query)
     is_chat_memory_used = "💾 **Stored Memory:**" in chat_memory_result  
 
-    # ✅ Step 2: Prepare memory context
+    # ✅ Prepare memory context only if relevant
     memory_context = ""
     if is_chat_memory_used:
-        memory_context = f"Here is past memory that may help answer the question:\n\n{chat_memory_result}\n\n"
+        memory_context = f"💾 **Source: Chat Memory**\n\n{chat_memory_result}\n\n"
         print(f"🧠 DEBUG: Passing FAISS memory into model:\n{memory_context}")  # Debugging
 
     try:
-        # ✅ Step 3: Pass memory as context for model to use
+        # ✅ Step 1: Ask the agent (includes Tavily & Wikipedia)
         agent_response = agent.invoke({"messages": [HumanMessage(content=memory_context + latest_query)]})
 
         retrieved_info = ""
+        source_label = ""
+
         if isinstance(agent_response, dict) and "messages" in agent_response:
             messages_list = agent_response["messages"]
             for msg in messages_list:
                 if isinstance(msg, AIMessage):
-                    retrieved_info = msg.content
+                    retrieved_info = msg.content.strip()
 
+        # ✅ Step 2: Determine Source (Web, FAISS, or Wikipedia)
+        if "🌐 **Source: Web Search (Tavily)**" in retrieved_info:
+            source_label = "🌐 Web Search:\n\n"
+        elif "🌍 **Source: Wikipedia**" in retrieved_info:
+            source_label = "🌍 Wikipedia:\n\n"
+        elif is_chat_memory_used:
+            source_label = "💾 Chat Memory:\n\n"
+
+        # ✅ Step 3: Format final response
         if not retrieved_info:
             print("⚠️ No AIMessage found. Using fallback response.")
             retrieved_info = "I'm not sure how to respond to that."
 
-        # ✅ Step 4: Print debug info
-        if is_chat_memory_used:
-            print(f"🔍 DEBUG: FAISS Chat Memory Retrieved - {chat_memory_result}")
+        final_response = f"{source_label}{retrieved_info}".strip()
 
-        # ✅ Step 5: Append FAISS memory to response
-        sources = []
-        if is_chat_memory_used:
-            sources.append(f"💾 **Source: Chat Memory**\n\n{chat_memory_result}")  
-
-        response_content = "\n\n".join(sources) + f"\n\n{retrieved_info}".strip()
-        return {"messages": trimmed_messages + [AIMessage(content=response_content)]}
+        return {"messages": trimmed_messages + [AIMessage(content=final_response)]}
 
     except Exception as e:
         print(f"\n❌ ERROR: `agent.invoke()` failed!\n{e}\n")
         return {"messages": trimmed_messages + [AIMessage(content="Sorry, an error occurred.")]}
-
 
 # Define the chatbot workflow
 workflow = StateGraph(state_schema=MessagesState)
